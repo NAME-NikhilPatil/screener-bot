@@ -12,7 +12,6 @@ from alerter import print_combined_alert
 from parser import (
     build_alert_metrics,
     company_alert_needed,
-    company_state_changed,
     latest_state_values,
     parse_company_id,
     yoy_alert_needed,
@@ -73,7 +72,7 @@ async def run_cycle(
             alert_metrics = build_alert_metrics(metrics)
             should_alert = company_alert_needed(alert_metrics, previous_state)
             if not should_alert and yoy_alert_needed(company.get("yoy")):
-                should_alert = company_state_changed(alert_metrics, previous_state)
+                should_alert = _company_state_changed(alert_metrics, previous_state)
 
             if should_alert:
                 alert_message = print_combined_alert(company["name"], alert_metrics, company.get("yoy"))
@@ -164,6 +163,43 @@ def _scan_interval_seconds() -> int:
     except ValueError:
         return DEFAULT_SCAN_INTERVAL_SECONDS
     return max(1, value)
+
+
+def _company_state_changed(alert_metrics, state_values: dict[str, float] | None = None) -> bool:
+    if not state_values:
+        return True
+
+    normalized_state = _normalize_state_values(state_values)
+    for metric, value in latest_state_values(alert_metrics).items():
+        if normalized_state.get(metric) != value:
+            return True
+    return False
+
+
+def _normalize_state_values(state_values: dict[str, float]) -> dict[str, float]:
+    if "pat_margin_pct" in state_values or "ebitda_margin_pct" in state_values:
+        return state_values
+
+    sales = state_values.get("sales")
+    normalized: dict[str, float] = {}
+    if sales is not None:
+        normalized["sales"] = sales
+
+    pat_margin = _margin_pct(state_values.get("net_profit"), sales)
+    if pat_margin is not None:
+        normalized["pat_margin_pct"] = pat_margin
+
+    ebitda_margin = _margin_pct(state_values.get("op_profit"), sales)
+    if ebitda_margin is not None:
+        normalized["ebitda_margin_pct"] = ebitda_margin
+
+    return normalized
+
+
+def _margin_pct(numerator: float | None, revenue: float | None) -> float | None:
+    if numerator is None or revenue is None or revenue == 0:
+        return None
+    return (numerator / revenue) * 100
 
 
 def parse_args() -> argparse.Namespace:

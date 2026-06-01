@@ -32,6 +32,8 @@ YOY_METRIC_DISPLAY_NAMES = {
     "net_profit": "PAT YOY",
 }
 
+MIN_MARKET_CAP_CR = 200.0
+
 
 @dataclass(frozen=True)
 class MetricQuarterValues:
@@ -62,7 +64,11 @@ def parse_company_id(url: str) -> str:
     return match.group(1)
 
 
-def parse_latest_results_companies(html: str, base_url: str = "https://www.screener.in") -> list[dict[str, str]]:
+def parse_latest_results_companies(
+    html: str,
+    base_url: str = "https://www.screener.in",
+    min_market_cap_cr: float = MIN_MARKET_CAP_CR,
+) -> list[dict[str, str]]:
     soup = BeautifulSoup(html, "html.parser")
     companies: list[dict] = []
     seen_ids: set[str] = set()
@@ -78,12 +84,17 @@ def parse_latest_results_companies(html: str, base_url: str = "https://www.scree
         if company_id in seen_ids:
             continue
 
+        market_cap_cr = parse_market_cap_cr(_nearby_market_cap_text(link))
+        if market_cap_cr is None or market_cap_cr < min_market_cap_cr:
+            continue
+
         seen_ids.add(company_id)
         companies.append(
             {
                 "id": company_id,
                 "name": name,
                 "url": url.split("#")[0] + "#quarters",
+                "market_cap_cr": market_cap_cr,
                 "yoy": parse_latest_results_yoy_table(link.find_next("table")),
             }
         )
@@ -201,6 +212,37 @@ def parse_yoy_percent(value: str) -> float | None:
     return number
 
 
+def parse_market_cap_cr(value: str) -> float | None:
+    match = re.search(
+        r"M\.?\s*Cap\s*(?:\u20b9|Rs\.?|INR)?\s*([0-9,.]+)\s*(Cr|Crore|Lac|Lakh)?",
+        value,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+
+    amount = parse_number(match.group(1))
+    if amount is None:
+        return None
+
+    unit = (match.group(2) or "Cr").lower()
+    if unit in {"lac", "lakh"}:
+        return amount / 100
+    return amount
+
+
+def _nearby_market_cap_text(link) -> str:
+    for parent in link.parents:
+        if parent.name in {"body", "html"}:
+            break
+
+        text = parent.get_text(" ", strip=True)
+        if "M.Cap" in text or "M Cap" in text:
+            return text
+
+    return link.get_text(" ", strip=True)
+
+
 def _extract_headers(table) -> list[str]:
     header_row = table.select_one("thead tr") or table.select_one("tr")
     if not header_row:
@@ -284,6 +326,50 @@ def company_alert_needed(alert_metrics: dict[str, AlertMetricValues], state_valu
             return True
 
     return False
+
+
+def company_state_changed(alert_metrics: dict[str, AlertMetricValues], state_values: dict[str, float] | None = None) -> bool:
+    if not state_values:
+        return True
+
+    normalized_state = normalize_state_values(state_values)
+    for metric, values in latest_state_values(alert_metrics).items():
+        if normalized_state.get(metric) != values:
+            return True
+
+    return False
+
+
+def yoy_alert_needed(yoy_metrics: dict[str, YoyMetricValues] | None, threshold: float = 20.0) -> bool:
+    if not yoy_metrics:
+        return False
+
+    for metric in ("sales", "op_profit", "net_profit"):
+        change = calculate_yoy_alert_change(metric, yoy_metrics)
+        if change is not None and abs(change) >= threshold:
+            return True
+
+    return False
+
+
+def calculate_yoy_alert_change(metric: str, yoy_metrics: dict[str, YoyMetricValues]) -> float | None:
+    values = yoy_metrics.get(metric)
+    if values is None:
+        return None
+
+    if metric == "sales":
+        return values.change
+
+    sales_values = yoy_metrics.get("sales")
+    previous_margin = calculate_margin_pct(
+        values.previous,
+        sales_values.previous if sales_values else None,
+    )
+    current_margin = calculate_margin_pct(
+        values.current,
+        sales_values.current if sales_values else None,
+    )
+    return calculate_percentage_change(current_margin, previous_margin)
 
 
 def latest_state_values(alert_metrics: dict[str, AlertMetricValues]) -> dict[str, float]:
