@@ -3,3 +3,4 @@ telegram_subscribers.json
 telegram_subscribers.json.tmp
 __pycache__/
 *.pyc
+state.json
