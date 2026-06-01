@@ -2,20 +2,32 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import contextlib
-import json
 import logging
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
 
 from alerter import print_combined_alert
-from parser import build_alert_metrics, company_alert_needed, latest_state_values, parse_company_id
+from parser import (
+    build_alert_metrics,
+    company_alert_needed,
+    company_state_changed,
+    latest_state_values,
+    parse_company_id,
+    yoy_alert_needed,
+)
 from scraper import launch_browser, polite_company_delay, scrape_company_metrics_with_retries, scrape_latest_companies
-from telegram_notifier import TelegramNotifier, load_env_file
+from storage import get_storage
+from telegram_notifier import (
+    TelegramNotifier,
+    load_env_file,
+    poll_telegram_subscribers_once,
+    send_telegram_alert_to_all,
+)
 
 STATE_FILE = Path("state.json")
-SLEEP_SECONDS = 60
+DEFAULT_SCAN_INTERVAL_SECONDS = 300
 
 
 def configure_console() -> None:
@@ -25,17 +37,14 @@ def configure_console() -> None:
 
 
 def load_state(path: Path = STATE_FILE) -> dict[str, dict[str, float]]:
-    if not path.exists():
-        return {}
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        logging.warning("State file is invalid JSON; starting with empty state")
-        return {}
+    state_name = os.getenv("STATE_BLOB_NAME", str(path))
+    data = get_storage().load_json(state_name, {})
+    return data if isinstance(data, dict) else {}
 
 
 def save_state(state: dict[str, dict[str, float]], path: Path = STATE_FILE) -> None:
-    path.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
+    state_name = os.getenv("STATE_BLOB_NAME", str(path))
+    get_storage().save_json(state_name, state)
 
 
 async def run_cycle(
@@ -45,7 +54,6 @@ async def run_cycle(
     company_limit: int | None = None,
     direct_company: dict[str, str] | None = None,
     login_wait_seconds: int = 0,
-    telegram_notifier: TelegramNotifier | None = None,
 ) -> bool:
     companies = [direct_company] if direct_company else await scrape_latest_companies(page, login_wait_seconds)
     if company_limit is not None:
@@ -63,10 +71,13 @@ async def run_cycle(
             metrics = await scrape_company_metrics_with_retries(page, company)
             previous_state = state.get(company["id"])
             alert_metrics = build_alert_metrics(metrics)
-            if company_alert_needed(alert_metrics, previous_state):
+            should_alert = company_alert_needed(alert_metrics, previous_state)
+            if not should_alert and yoy_alert_needed(company.get("yoy")):
+                should_alert = company_state_changed(alert_metrics, previous_state)
+
+            if should_alert:
                 alert_message = print_combined_alert(company["name"], alert_metrics, company.get("yoy"))
-                if telegram_notifier:
-                    telegram_notifier.send_message(alert_message)
+                send_telegram_alert_to_all(alert_message)
                 alerts_detected = True
 
             state[company["id"]] = latest_state_values(alert_metrics)
@@ -94,16 +105,12 @@ async def monitor(
     configure_console()
     load_env_file()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    telegram_notifier = TelegramNotifier.from_env()
-    startup_message = f"Screener Bot Started - Monitoring every {SLEEP_SECONDS} seconds"
+    scan_interval_seconds = _scan_interval_seconds()
+    startup_message = f"Screener Bot Started - Monitoring every {scan_interval_seconds} seconds"
     print(startup_message, flush=True)
-    subscriber_task = None
-    if telegram_notifier:
-        await asyncio.to_thread(telegram_notifier.process_updates)
-        subscriber_count = len(telegram_notifier.get_subscribers())
-        print(f"Telegram notifications enabled for {subscriber_count} subscriber(s)", flush=True)
-        telegram_notifier.send_message(startup_message)
-        subscriber_task = asyncio.create_task(poll_telegram_subscribers(telegram_notifier))
+    await asyncio.to_thread(poll_telegram_subscribers_once)
+    if os.getenv("TELEGRAM_BOT_TOKEN", "").strip():
+        send_telegram_alert_to_all(startup_message)
     state = load_state()
     playwright, browser, page = await launch_browser(headless=headless, user_data_dir=user_data_dir)
     direct_company = None
@@ -117,42 +124,46 @@ async def monitor(
         cycle = 1
         while True:
             try:
-                await run_cycle(
-                    page,
-                    cycle,
-                    state,
-                    company_limit=company_limit,
-                    direct_company=direct_company,
-                    login_wait_seconds=login_wait_seconds,
-                    telegram_notifier=telegram_notifier,
-                )
+                await asyncio.to_thread(poll_telegram_subscribers_once)
+                try:
+                    await run_cycle(
+                        page,
+                        cycle,
+                        state,
+                        company_limit=company_limit,
+                        direct_company=direct_company,
+                        login_wait_seconds=login_wait_seconds,
+                    )
+                finally:
+                    await asyncio.to_thread(poll_telegram_subscribers_once)
             except Exception:
                 logging.exception("Cycle #%s failed", cycle)
                 if once:
                     raise
             if once:
                 break
-            await asyncio.sleep(SLEEP_SECONDS)
+            await sleep_with_telegram_polling(scan_interval_seconds)
             cycle += 1
     finally:
-        if subscriber_task:
-            subscriber_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await subscriber_task
         await browser.close()
         await playwright.stop()
 
 
-async def poll_telegram_subscribers(telegram_notifier: TelegramNotifier, interval_seconds: int = 5) -> None:
-    while True:
-        try:
-            changes = await asyncio.to_thread(telegram_notifier.process_updates)
-            if changes:
-                subscriber_count = len(telegram_notifier.get_subscribers())
-                print(f"Telegram subscribers updated: {subscriber_count} active", flush=True)
-        except Exception:
-            logging.exception("Telegram subscriber polling failed")
-        await asyncio.sleep(interval_seconds)
+async def sleep_with_telegram_polling(total_seconds: int) -> None:
+    remaining_seconds = max(0, int(total_seconds))
+    while remaining_seconds > 0:
+        sleep_seconds = min(10, remaining_seconds)
+        await asyncio.sleep(sleep_seconds)
+        remaining_seconds -= sleep_seconds
+        await asyncio.to_thread(poll_telegram_subscribers_once)
+
+
+def _scan_interval_seconds() -> int:
+    try:
+        value = int(os.getenv("SCAN_INTERVAL_SECONDS", str(DEFAULT_SCAN_INTERVAL_SECONDS)))
+    except ValueError:
+        return DEFAULT_SCAN_INTERVAL_SECONDS
+    return max(1, value)
 
 
 def parse_args() -> argparse.Namespace:

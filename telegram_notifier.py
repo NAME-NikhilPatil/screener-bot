@@ -8,8 +8,11 @@ from datetime import datetime
 from pathlib import Path
 from urllib import error, parse, request
 
+from storage import get_storage
+
 LOGGER = logging.getLogger(__name__)
 DEFAULT_SUBSCRIBERS_FILE = Path("telegram_subscribers.json")
+DEFAULT_OFFSET_FILE = Path("telegram_offset.json")
 
 
 def load_env_file(path: Path = Path(".env")) -> None:
@@ -33,7 +36,7 @@ class TelegramNotifier:
     bot_token: str
     seed_chat_ids: tuple[str, ...] = ()
     subscribers_path: Path = DEFAULT_SUBSCRIBERS_FILE
-    timeout_seconds: float = 10.0
+    timeout_seconds: float = 15.0
 
     @classmethod
     def from_env(cls) -> "TelegramNotifier | None":
@@ -41,101 +44,68 @@ class TelegramNotifier:
         if not bot_token:
             return None
 
-        try:
-            timeout_seconds = float(os.getenv("TELEGRAM_TIMEOUT_SECONDS", "10"))
-        except ValueError:
-            timeout_seconds = 10.0
-
-        subscribers_path = Path(os.getenv("TELEGRAM_SUBSCRIBERS_FILE", str(DEFAULT_SUBSCRIBERS_FILE)))
         notifier = cls(
             bot_token=bot_token,
             seed_chat_ids=_env_chat_ids(),
-            subscribers_path=subscribers_path,
-            timeout_seconds=timeout_seconds,
+            subscribers_path=Path(_subscribers_name()),
+            timeout_seconds=_telegram_timeout_seconds(),
         )
         notifier.seed_subscribers()
         return notifier
 
     def send_message(self, text: str) -> bool:
-        subscribers = self.get_subscribers()
-        if not subscribers:
-            LOGGER.warning("Telegram notification skipped because no subscribers are registered")
+        recipients = get_all_telegram_recipients()
+        if not recipients:
+            LOGGER.warning("Telegram notification skipped because no recipients are registered")
             return False
 
         sent_any = False
-        for subscriber in subscribers:
-            if self.send_to_chat(subscriber["chat_id"], text):
+        for chat_id in recipients:
+            if self.send_to_chat(chat_id, text):
                 sent_any = True
 
         return sent_any
 
     def send_to_chat(self, chat_id: str, text: str) -> bool:
-        payload = parse.urlencode(
-            {
-                "chat_id": chat_id,
-                "text": text[:4096],
-                "disable_web_page_preview": "true",
-            }
-        ).encode("utf-8")
-        api_url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
-        telegram_request = request.Request(api_url, data=payload, method="POST")
-
-        try:
-            with request.urlopen(telegram_request, timeout=self.timeout_seconds) as response:
-                if response.status == 200:
-                    return True
-                LOGGER.warning("Telegram notification failed with HTTP %s", response.status)
-        except error.HTTPError as exc:
-            details = _telegram_error_details(exc)
-            if details:
-                LOGGER.warning("Telegram notification failed with HTTP %s: %s", exc.code, details)
-            else:
-                LOGGER.warning("Telegram notification failed with HTTP %s", exc.code)
-        except error.URLError as exc:
-            LOGGER.warning("Telegram notification failed: %s", exc.reason)
-        except TimeoutError:
-            LOGGER.warning("Telegram notification timed out")
-
-        return False
+        return _send_to_chat(self.bot_token, chat_id, text, self.timeout_seconds)
 
     def seed_subscribers(self) -> None:
-        if not self.seed_chat_ids:
-            return
-
-        data = self._load_subscriber_data()
-        subscribers = data.setdefault("subscribers", {})
-        changed = False
-        for chat_id in self.seed_chat_ids:
-            if chat_id in subscribers:
-                continue
-            subscribers[chat_id] = {
-                "chat_id": chat_id,
-                "type": "",
-                "title": "Configured chat",
-                "source": "env",
-                "subscribed_at": _now_text(),
-            }
-            changed = True
-
-        if changed:
-            self._save_subscriber_data(data)
+        # Static recipients are intentionally read from env at send time. This
+        # method remains for compatibility with the previous class API.
+        return None
 
     def process_updates(self) -> int:
-        data = self._load_subscriber_data()
-        offset = _next_update_offset(data.get("last_update_id"))
-        updates = self._fetch_updates(offset=offset)
+        return poll_telegram_subscribers_once()
+
+    def get_subscribers(self) -> list[dict[str, str]]:
+        return _load_dynamic_subscribers()
+
+    def get_chat_candidates(self) -> list[dict[str, str]]:
+        bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip() or self.bot_token
+        updates = _fetch_updates(bot_token, offset=None, timeout_seconds=self.timeout_seconds)
+        return _chat_candidates_from_updates(updates)
+
+
+def poll_telegram_subscribers_once() -> int:
+    bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    if not bot_token:
+        return 0
+
+    try:
+        offset_data = _load_offset_data()
+        offset = _offset_value(offset_data)
+        updates = _fetch_updates(bot_token, offset=offset, timeout_seconds=_telegram_timeout_seconds())
         if not updates:
             return 0
 
-        subscribers = data.setdefault("subscribers", {})
-        last_update_id = data.get("last_update_id")
-        max_update_id = last_update_id if isinstance(last_update_id, int) else None
+        subscribers = {item["chat_id"]: item for item in _load_dynamic_subscribers() if item.get("chat_id")}
+        max_next_offset = offset
         changes = 0
 
         for update in updates:
             update_id = update.get("update_id")
             if isinstance(update_id, int):
-                max_update_id = update_id if max_update_id is None else max(max_update_id, update_id)
+                max_next_offset = max(max_next_offset or 0, update_id + 1)
 
             message = update.get("message") or update.get("channel_post") or update.get("edited_message")
             if not isinstance(message, dict):
@@ -150,108 +120,160 @@ class TelegramNotifier:
             chat_id = str(chat["id"])
             if command == "/start":
                 is_new = chat_id not in subscribers
+                existing = subscribers.get(chat_id, {})
                 subscribers[chat_id] = {
                     "chat_id": chat_id,
                     "type": str(chat.get("type", "")),
                     "title": _chat_display_name(chat),
                     "source": "telegram_start",
-                    "subscribed_at": subscribers.get(chat_id, {}).get("subscribed_at", _now_text()),
+                    "subscribed_at": existing.get("subscribed_at", _now_text()),
                     "updated_at": _now_text(),
                 }
                 changes += 1 if is_new else 0
-                self.send_to_chat(chat_id, "Screener Bot alerts enabled for this chat.")
+                _send_to_chat(bot_token, chat_id, "Screener Bot alerts enabled for this chat.", _telegram_timeout_seconds())
             elif command == "/stop":
                 if chat_id in subscribers:
                     subscribers.pop(chat_id)
                     changes += 1
-                self.send_to_chat(chat_id, "Screener Bot alerts disabled for this chat.")
+                _send_to_chat(bot_token, chat_id, "Screener Bot alerts disabled for this chat.", _telegram_timeout_seconds())
 
-        if max_update_id is not None:
-            data["last_update_id"] = max_update_id
-
-        self._save_subscriber_data(data)
+        _save_dynamic_subscribers(sorted(subscribers.values(), key=lambda item: item["chat_id"]))
+        if max_next_offset is not None:
+            _save_offset_data({"offset": max_next_offset})
         return changes
+    except Exception:
+        LOGGER.exception("Telegram subscriber polling failed")
+        return 0
 
-    def get_subscribers(self) -> list[dict[str, str]]:
-        data = self._load_subscriber_data()
-        subscribers = data.get("subscribers", {})
-        if not isinstance(subscribers, dict):
-            return []
-        return sorted(subscribers.values(), key=lambda item: str(item.get("chat_id", "")))
 
-    def get_chat_candidates(self) -> list[dict[str, str]]:
-        updates = self._fetch_updates(offset=None)
-        candidates: dict[str, dict[str, str]] = {}
-        for update in updates:
-            message = update.get("message") or update.get("channel_post") or update.get("edited_message")
-            if not isinstance(message, dict):
-                continue
+def get_all_telegram_recipients() -> list[str]:
+    recipients: set[str] = set(_env_chat_ids())
+    for subscriber in _load_dynamic_subscribers():
+        chat_id = str(subscriber.get("chat_id", "")).strip()
+        if chat_id:
+            recipients.add(chat_id)
+    return sorted(recipients)
 
-            chat = message.get("chat")
-            if not isinstance(chat, dict) or "id" not in chat:
-                continue
 
-            chat_id = str(chat["id"])
-            candidates[chat_id] = {
-                "chat_id": chat_id,
-                "type": str(chat.get("type", "")),
-                "title": _chat_display_name(chat),
-            }
+def send_telegram_alert_to_all(message: str) -> bool:
+    bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    if not bot_token:
+        LOGGER.warning("Telegram notification skipped because TELEGRAM_BOT_TOKEN is not configured")
+        return False
 
-        return list(candidates.values())
+    recipients = get_all_telegram_recipients()
+    if not recipients:
+        LOGGER.warning("Telegram notification skipped because no recipients are registered")
+        return False
 
-    def _fetch_updates(self, offset: int | None) -> list[dict]:
-        query = {"timeout": "0"}
-        if offset is not None:
-            query["offset"] = str(offset)
+    sent_any = False
+    for chat_id in recipients:
+        if _send_to_chat(bot_token, chat_id, message, _telegram_timeout_seconds()):
+            sent_any = True
+    return sent_any
 
-        api_url = f"https://api.telegram.org/bot{self.bot_token}/getUpdates?{parse.urlencode(query)}"
-        telegram_request = request.Request(api_url, method="GET")
 
-        try:
-            with request.urlopen(telegram_request, timeout=self.timeout_seconds) as response:
-                data = json.loads(response.read().decode("utf-8", errors="replace"))
-        except error.HTTPError as exc:
-            details = _telegram_error_details(exc)
-            if details:
-                LOGGER.warning("Telegram getUpdates failed with HTTP %s: %s", exc.code, details)
-            else:
-                LOGGER.warning("Telegram getUpdates failed with HTTP %s", exc.code)
-            return []
-        except error.URLError as exc:
-            LOGGER.warning("Telegram getUpdates failed: %s", exc.reason)
-            return []
-        except TimeoutError:
-            LOGGER.warning("Telegram getUpdates timed out")
-            return []
-        except json.JSONDecodeError:
-            LOGGER.warning("Telegram getUpdates returned invalid JSON")
-            return []
+def _send_to_chat(bot_token: str, chat_id: str, text: str, timeout_seconds: float) -> bool:
+    payload = parse.urlencode(
+        {
+            "chat_id": chat_id,
+            "text": text[:4096],
+            "disable_web_page_preview": "true",
+        }
+    ).encode("utf-8")
+    api_url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    telegram_request = request.Request(api_url, data=payload, method="POST")
 
-        updates = data.get("result", [])
-        return updates if isinstance(updates, list) else []
+    try:
+        with request.urlopen(telegram_request, timeout=timeout_seconds) as response:
+            if response.status == 200:
+                return True
+            LOGGER.warning("Telegram notification failed with HTTP %s", response.status)
+    except error.HTTPError as exc:
+        details = _telegram_error_details(exc)
+        if details:
+            LOGGER.warning("Telegram notification failed with HTTP %s: %s", exc.code, details)
+        else:
+            LOGGER.warning("Telegram notification failed with HTTP %s", exc.code)
+    except error.URLError as exc:
+        LOGGER.warning("Telegram notification failed: %s", exc.reason)
+    except TimeoutError:
+        LOGGER.warning("Telegram notification timed out")
 
-    def _load_subscriber_data(self) -> dict:
-        if not self.subscribers_path.exists():
-            return {"last_update_id": None, "subscribers": {}}
+    return False
 
-        try:
-            data = json.loads(self.subscribers_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            LOGGER.warning("Telegram subscribers file is invalid; starting with an empty subscriber list")
-            return {"last_update_id": None, "subscribers": {}}
 
-        if not isinstance(data, dict):
-            return {"last_update_id": None, "subscribers": {}}
-        if not isinstance(data.get("subscribers"), dict):
-            data["subscribers"] = {}
-        return data
+def _fetch_updates(bot_token: str, offset: int | None, timeout_seconds: float) -> list[dict]:
+    query = {"timeout": "0"}
+    if offset is not None and offset > 0:
+        query["offset"] = str(offset)
 
-    def _save_subscriber_data(self, data: dict) -> None:
-        self.subscribers_path.parent.mkdir(parents=True, exist_ok=True)
-        temp_path = self.subscribers_path.with_suffix(self.subscribers_path.suffix + ".tmp")
-        temp_path.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
-        temp_path.replace(self.subscribers_path)
+    api_url = f"https://api.telegram.org/bot{bot_token}/getUpdates?{parse.urlencode(query)}"
+    telegram_request = request.Request(api_url, method="GET")
+
+    try:
+        with request.urlopen(telegram_request, timeout=timeout_seconds) as response:
+            data = json.loads(response.read().decode("utf-8", errors="replace"))
+    except error.HTTPError as exc:
+        details = _telegram_error_details(exc)
+        if details:
+            LOGGER.warning("Telegram getUpdates failed with HTTP %s: %s", exc.code, details)
+        else:
+            LOGGER.warning("Telegram getUpdates failed with HTTP %s", exc.code)
+        return []
+    except error.URLError as exc:
+        LOGGER.warning("Telegram getUpdates failed: %s", exc.reason)
+        return []
+    except TimeoutError:
+        LOGGER.warning("Telegram getUpdates timed out")
+        return []
+    except json.JSONDecodeError:
+        LOGGER.warning("Telegram getUpdates returned invalid JSON")
+        return []
+
+    updates = data.get("result", [])
+    return updates if isinstance(updates, list) else []
+
+
+def _load_dynamic_subscribers() -> list[dict[str, str]]:
+    data = get_storage().load_json(_subscribers_name(), [])
+    if isinstance(data, list):
+        return [_normalize_subscriber(item) for item in data if isinstance(item, dict) and item.get("chat_id")]
+
+    if isinstance(data, dict):
+        subscribers = data.get("subscribers", data)
+        if isinstance(subscribers, dict):
+            return [
+                _normalize_subscriber(item)
+                for item in subscribers.values()
+                if isinstance(item, dict) and item.get("chat_id")
+            ]
+
+    return []
+
+
+def _save_dynamic_subscribers(subscribers: list[dict[str, str]]) -> None:
+    get_storage().save_json(_subscribers_name(), subscribers)
+
+
+def _load_offset_data() -> dict:
+    data = get_storage().load_json(_offset_name(), {"offset": 0})
+    return data if isinstance(data, dict) else {"offset": 0}
+
+
+def _save_offset_data(data: dict) -> None:
+    get_storage().save_json(_offset_name(), data)
+
+
+def _normalize_subscriber(item: dict) -> dict[str, str]:
+    return {
+        "chat_id": str(item.get("chat_id", "")).strip(),
+        "type": str(item.get("type", "")),
+        "title": str(item.get("title", "")),
+        "source": str(item.get("source", "telegram_start")),
+        "subscribed_at": str(item.get("subscribed_at", "")),
+        "updated_at": str(item.get("updated_at", "")),
+    }
 
 
 def _telegram_error_details(exc: error.HTTPError) -> str:
@@ -267,6 +289,27 @@ def _telegram_error_details(exc: error.HTTPError) -> str:
 
     description = data.get("description")
     return str(description)[:200] if description else ""
+
+
+def _chat_candidates_from_updates(updates: list[dict]) -> list[dict[str, str]]:
+    candidates: dict[str, dict[str, str]] = {}
+    for update in updates:
+        message = update.get("message") or update.get("channel_post") or update.get("edited_message")
+        if not isinstance(message, dict):
+            continue
+
+        chat = message.get("chat")
+        if not isinstance(chat, dict) or "id" not in chat:
+            continue
+
+        chat_id = str(chat["id"])
+        candidates[chat_id] = {
+            "chat_id": chat_id,
+            "type": str(chat.get("type", "")),
+            "title": _chat_display_name(chat),
+        }
+
+    return list(candidates.values())
 
 
 def _chat_display_name(chat: dict) -> str:
@@ -296,10 +339,24 @@ def _message_command(text: str) -> str:
     return command.split("@", 1)[0].lower()
 
 
-def _next_update_offset(last_update_id: object) -> int | None:
-    if isinstance(last_update_id, int):
-        return last_update_id + 1
-    return None
+def _offset_value(data: dict) -> int:
+    offset = data.get("offset", 0)
+    return offset if isinstance(offset, int) and offset >= 0 else 0
+
+
+def _subscribers_name() -> str:
+    return os.getenv("SUBSCRIBERS_BLOB_NAME", os.getenv("TELEGRAM_SUBSCRIBERS_FILE", str(DEFAULT_SUBSCRIBERS_FILE)))
+
+
+def _offset_name() -> str:
+    return os.getenv("TELEGRAM_OFFSET_BLOB_NAME", str(DEFAULT_OFFSET_FILE))
+
+
+def _telegram_timeout_seconds() -> float:
+    try:
+        return float(os.getenv("TELEGRAM_TIMEOUT_SECONDS", "15"))
+    except ValueError:
+        return 15.0
 
 
 def _now_text() -> str:
