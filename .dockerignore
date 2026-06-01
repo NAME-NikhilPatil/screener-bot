@@ -1,0 +1,8 @@
+.env
+__pycache__
+*.pyc
+.git
+.vscode
+state.json
+telegram_subscribers.json
+playwright_storage_state.json
