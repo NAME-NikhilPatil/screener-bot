@@ -94,7 +94,9 @@ def poll_telegram_subscribers_once() -> int:
     try:
         offset_data = _load_offset_data()
         offset = _offset_value(offset_data)
+        print(f"Telegram polling started with offset: {offset}", flush=True)
         updates = _fetch_updates(bot_token, offset=offset, timeout_seconds=_telegram_timeout_seconds())
+        print(f"Telegram updates received: {len(updates)}", flush=True)
         if not updates:
             return 0
 
@@ -118,7 +120,9 @@ def poll_telegram_subscribers_once() -> int:
                 continue
 
             chat_id = str(chat["id"])
+            print(f"Telegram update message: update_id={update_id} chat_id={chat_id} text={text}", flush=True)
             if command == "/start":
+                print(f"Processing /start for chat_id: {chat_id}", flush=True)
                 is_new = chat_id not in subscribers
                 existing = subscribers.get(chat_id, {})
                 subscribers[chat_id] = {
@@ -132,16 +136,20 @@ def poll_telegram_subscribers_once() -> int:
                 changes += 1 if is_new else 0
                 _send_to_chat(bot_token, chat_id, "Screener Bot alerts enabled for this chat.", _telegram_timeout_seconds())
             elif command == "/stop":
+                print(f"Processing /stop for chat_id: {chat_id}", flush=True)
                 if chat_id in subscribers:
                     subscribers.pop(chat_id)
                     changes += 1
                 _send_to_chat(bot_token, chat_id, "Screener Bot alerts disabled for this chat.", _telegram_timeout_seconds())
 
         _save_dynamic_subscribers(sorted(subscribers.values(), key=lambda item: item["chat_id"]))
+        print(f"Dynamic Telegram subscribers saved: {len(subscribers)}", flush=True)
         if max_next_offset is not None:
             _save_offset_data({"offset": max_next_offset})
+            print(f"Telegram offset saved: {max_next_offset}", flush=True)
         return changes
-    except Exception:
+    except Exception as exc:
+        print(f"Telegram subscriber polling failed: {exc.__class__.__name__}: {exc}", flush=True)
         LOGGER.exception("Telegram subscriber polling failed")
         return 0
 
@@ -218,20 +226,26 @@ def _fetch_updates(bot_token: str, offset: int | None, timeout_seconds: float) -
         details = _telegram_error_details(exc)
         if details:
             LOGGER.warning("Telegram getUpdates failed with HTTP %s: %s", exc.code, details)
+            print(f"Telegram getUpdates request failed: HTTP {exc.code}: {details}", flush=True)
         else:
             LOGGER.warning("Telegram getUpdates failed with HTTP %s", exc.code)
+            print(f"Telegram getUpdates request failed: HTTP {exc.code}", flush=True)
         return []
     except error.URLError as exc:
         LOGGER.warning("Telegram getUpdates failed: %s", exc.reason)
+        print(f"Telegram getUpdates request failed: URLError: {exc.reason}", flush=True)
         return []
     except TimeoutError:
         LOGGER.warning("Telegram getUpdates timed out")
+        print("Telegram getUpdates request failed: TimeoutError", flush=True)
         return []
     except json.JSONDecodeError:
         LOGGER.warning("Telegram getUpdates returned invalid JSON")
+        print("Telegram getUpdates request failed: invalid JSON response", flush=True)
         return []
 
     updates = data.get("result", [])
+    print(f"Telegram getUpdates response ok: {str(bool(data.get('ok'))).lower()}", flush=True)
     return updates if isinstance(updates, list) else []
 
 
