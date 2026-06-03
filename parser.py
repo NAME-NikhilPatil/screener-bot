@@ -78,6 +78,8 @@ def parse_latest_results_companies(
         name = " ".join(link.get_text(" ", strip=True).split())
         if not href or not name or "/company/" not in href:
             continue
+        if _is_non_company_result_link(name, href):
+            continue
 
         url = href if href.startswith("http") else f"{base_url}{href}"
         company_id = parse_company_id(url)
@@ -159,20 +161,19 @@ def parse_quarterly_metrics(html: str) -> dict[str, MetricQuarterValues]:
         previous = parse_number(numeric_cells[-2].get_text(" ", strip=True))
         current = parse_number(numeric_cells[-1].get_text(" ", strip=True))
         if previous is None or current is None:
-            raise ValueError(f"Metric row {label!r} contains non-numeric latest values")
+            LOGGER.warning("Skipping %s because latest quarter values are missing or non-numeric", label)
+            continue
 
         results[metric_key] = MetricQuarterValues(previous=previous, current=current)
 
-    missing = [name for name in METRIC_LABELS if name not in results]
-    if missing:
-        missing_display = ", ".join(METRIC_DISPLAY_NAMES[name] for name in missing)
-        raise ValueError(f"Quarterly results table missing metrics: {missing_display}")
+    if not results:
+        raise ValueError("Quarterly results table contains no supported metrics")
 
     return results
 
 
-def calculate_percentage_change(current: float, previous: float) -> float | None:
-    if previous is None or previous == 0:
+def calculate_percentage_change(current: float | None, previous: float | None) -> float | None:
+    if current is None or previous is None or previous == 0:
         return None
     return ((current - previous) / abs(previous)) * 100
 
@@ -243,6 +244,14 @@ def _nearby_market_cap_text(link) -> str:
     return link.get_text(" ", strip=True)
 
 
+def _is_non_company_result_link(name: str, href: str) -> bool:
+    normalized_name = name.strip().lower()
+    normalized_href = href.strip().lower()
+    if normalized_name in {"pdf", "raw pdf"}:
+        return True
+    return normalized_href.endswith(".pdf")
+
+
 def _extract_headers(table) -> list[str]:
     header_row = table.select_one("thead tr") or table.select_one("tr")
     if not header_row:
@@ -267,30 +276,35 @@ def build_alert_metrics(
     metrics: dict[str, MetricQuarterValues],
     threshold: float = 20.0,
 ) -> dict[str, AlertMetricValues]:
-    sales = metrics["sales"]
-    net_profit = metrics["net_profit"]
-    op_profit = metrics["op_profit"]
+    sales = metrics.get("sales")
+    net_profit = metrics.get("net_profit")
+    op_profit = metrics.get("op_profit")
 
-    derived_values = {
-        "sales": MetricQuarterValues(previous=sales.previous, current=sales.current),
-        "pat_margin_pct": MetricQuarterValues(
-            previous=calculate_margin_pct(net_profit.previous, sales.previous),
-            current=calculate_margin_pct(net_profit.current, sales.current),
-        ),
-        "ebitda_margin_pct": MetricQuarterValues(
-            previous=calculate_margin_pct(op_profit.previous, sales.previous),
-            current=calculate_margin_pct(op_profit.current, sales.current),
-        ),
+    alert_metrics: dict[str, AlertMetricValues] = {
+        metric: empty_alert_metric() for metric in ALERT_METRIC_DISPLAY_NAMES
     }
 
-    alert_metrics: dict[str, AlertMetricValues] = {}
-    for metric, values in derived_values.items():
-        change = calculate_percentage_change(values.current, values.previous)
+    derived_values: dict[str, tuple[float | None, float | None]] = {}
+    if sales is not None:
+        derived_values["sales"] = (sales.previous, sales.current)
+    if sales is not None and net_profit is not None:
+        derived_values["pat_margin_pct"] = (
+            calculate_margin_pct(net_profit.previous, sales.previous),
+            calculate_margin_pct(net_profit.current, sales.current),
+        )
+    if sales is not None and op_profit is not None:
+        derived_values["ebitda_margin_pct"] = (
+            calculate_margin_pct(op_profit.previous, sales.previous),
+            calculate_margin_pct(op_profit.current, sales.current),
+        )
+
+    for metric, (previous, current) in derived_values.items():
+        change = calculate_percentage_change(current, previous)
         if change is None:
             LOGGER.warning("Skipping %s because previous value is zero or missing", ALERT_METRIC_DISPLAY_NAMES[metric])
             alert_metrics[metric] = AlertMetricValues(
-                previous=values.previous,
-                current=values.current,
+                previous=previous,
+                current=current,
                 change=None,
                 direction=None,
                 triggered=False,
@@ -301,14 +315,18 @@ def build_alert_metrics(
         triggered = abs(change) >= threshold
 
         alert_metrics[metric] = AlertMetricValues(
-            previous=values.previous,
-            current=values.current,
+            previous=previous,
+            current=current,
             change=change,
             direction=direction,
             triggered=triggered,
         )
 
     return alert_metrics
+
+
+def empty_alert_metric() -> AlertMetricValues:
+    return AlertMetricValues(previous=None, current=None, change=None, direction=None, triggered=False)
 
 
 def company_alert_needed(alert_metrics: dict[str, AlertMetricValues], state_values: dict[str, float] | None = None) -> bool:

@@ -48,6 +48,7 @@ async def scrape_latest_companies(page: Page, login_wait_seconds: int = 0) -> li
                 "--user-data-dir .\\screener-profile --login-wait-seconds 120."
             )
     await page.wait_for_selector('a[href*="/company/"]', timeout=30000)
+    await _load_latest_results_cards(page)
     html = await page.content()
     return parse_latest_results_companies(html)
 
@@ -76,6 +77,24 @@ async def scrape_company_metrics(page: Page, company: dict[str, str]) -> dict[st
     await page.wait_for_selector("#quarters table", timeout=30000)
     html = await page.content()
     return parse_quarterly_metrics(html)
+
+
+async def _load_latest_results_cards(page: Page, max_scrolls: int = 12) -> None:
+    previous_count = -1
+    stable_rounds = 0
+    for _ in range(max_scrolls):
+        current_count = await page.locator('a[href*="/company/"]').count()
+        if current_count == previous_count:
+            stable_rounds += 1
+        else:
+            stable_rounds = 0
+            previous_count = current_count
+
+        if stable_rounds >= 2:
+            break
+
+        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        await page.wait_for_timeout(700)
 
 
 async def scrape_company_metrics_with_retries(page: Page, company: dict[str, str], retries: int = 2) -> dict[str, Any]:

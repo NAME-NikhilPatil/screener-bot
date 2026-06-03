@@ -70,16 +70,17 @@ async def run_cycle(
             metrics = await scrape_company_metrics_with_retries(page, company)
             previous_state = state.get(company["id"])
             alert_metrics = build_alert_metrics(metrics)
+            current_state = _latest_company_state_values(alert_metrics, company.get("yoy"))
             should_alert = company_alert_needed(alert_metrics, previous_state)
             if not should_alert and yoy_alert_needed(company.get("yoy")):
-                should_alert = _company_state_changed(alert_metrics, previous_state)
+                should_alert = _company_state_changed(current_state, previous_state)
 
             if should_alert:
                 alert_message = print_combined_alert(company["name"], alert_metrics, company.get("yoy"))
                 send_telegram_alert_to_all(alert_message)
                 alerts_detected = True
 
-            state[company["id"]] = latest_state_values(alert_metrics)
+            state[company["id"]] = current_state
         except Exception as exc:
             logging.warning("Skipping %s: %s", company.get("name", "unknown company"), exc)
 
@@ -165,15 +166,28 @@ def _scan_interval_seconds() -> int:
     return max(1, value)
 
 
-def _company_state_changed(alert_metrics, state_values: dict[str, float] | None = None) -> bool:
+def _company_state_changed(current_state_values: dict[str, float], state_values: dict[str, float] | None = None) -> bool:
     if not state_values:
         return True
 
     normalized_state = _normalize_state_values(state_values)
-    for metric, value in latest_state_values(alert_metrics).items():
+    for metric, value in current_state_values.items():
         if normalized_state.get(metric) != value:
             return True
     return False
+
+
+def _latest_company_state_values(alert_metrics, yoy_metrics=None) -> dict[str, float]:
+    values = latest_state_values(alert_metrics)
+    if not yoy_metrics:
+        return values
+
+    for metric, yoy_values in yoy_metrics.items():
+        if yoy_values.current is not None:
+            values[f"yoy_{metric}_current"] = yoy_values.current
+        if yoy_values.change is not None:
+            values[f"yoy_{metric}_change"] = yoy_values.change
+    return values
 
 
 def _normalize_state_values(state_values: dict[str, float]) -> dict[str, float]:
