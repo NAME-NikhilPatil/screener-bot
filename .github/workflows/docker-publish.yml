@@ -1,4 +1,4 @@
-name: Build and Push Docker Image
+name: Build, Push, and Deploy to Azure Container App
 
 on:
   push:
@@ -10,28 +10,70 @@ permissions:
   contents: read
   packages: write
 
-env:
-  IMAGE_NAME: ghcr.io/name-nikhilpatil/screener-bot:latest
-
 jobs:
-  build-and-push:
+  build-push-deploy:
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Set Docker image name
+        id: image
+        run: |
+          IMAGE_NAME=$(echo "ghcr.io/${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')
+          echo "image=$IMAGE_NAME" >> $GITHUB_OUTPUT
+          echo "Docker image will be: $IMAGE_NAME:${GITHUB_SHA}"
+
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io \
+            --username "${{ github.actor }}" \
+            --password-stdin
 
       - name: Build Docker image
         run: |
-          docker build -t $IMAGE_NAME .
+          docker build \
+            -t ${{ steps.image.outputs.image }}:${{ github.sha }} \
+            -t ${{ steps.image.outputs.image }}:latest \
+            .
 
       - name: Push Docker image
         run: |
-          docker push $IMAGE_NAME
+          docker push ${{ steps.image.outputs.image }}:${{ github.sha }}
+          docker push ${{ steps.image.outputs.image }}:latest
+
+      - name: Log in to Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Debug target Azure Container App
+        run: |
+          echo "Resource group:"
+          echo "${{ secrets.AZURE_RESOURCE_GROUP }}"
+
+          echo "Container app:"
+          echo "${{ secrets.AZURE_CONTAINER_APP_NAME }}"
+
+          az containerapp show \
+            --name "${{ secrets.AZURE_CONTAINER_APP_NAME }}" \
+            --resource-group "${{ secrets.AZURE_RESOURCE_GROUP }}" \
+            --query "{name:name, resourceGroup:resourceGroup, latestRevision:properties.latestRevisionName, provisioningState:properties.provisioningState}" \
+            --output table
+
+      - name: Configure Container App registry authentication
+        run: |
+          az containerapp registry set \
+            --name "${{ secrets.AZURE_CONTAINER_APP_NAME }}" \
+            --resource-group "${{ secrets.AZURE_RESOURCE_GROUP }}" \
+            --server ghcr.io \
+            --username "${{ secrets.GHCR_USERNAME }}" \
+            --password "${{ secrets.GHCR_PAT }}"
+
+      - name: Deploy image to Azure Container App
+        run: |
+          az containerapp update \
+            --name "${{ secrets.AZURE_CONTAINER_APP_NAME }}" \
+            --resource-group "${{ secrets.AZURE_RESOURCE_GROUP }}" \
+            --image "${{ steps.image.outputs.image }}:${{ github.sha }}"
