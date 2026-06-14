@@ -114,7 +114,9 @@ def parse_latest_results_yoy_table(table) -> dict[str, YoyMetricValues]:
         if len(cells) < 4:
             continue
 
-        label = _normalize_label(cells[0].get_text(" ", strip=True))
+        label = _normalize_label(_row_label_text(cells[0]))
+        if _skip_table_row(label):
+            continue
         metric_key = _metric_key_for_label(label)
         if metric_key not in {"sales", "op_profit", "net_profit"}:
             continue
@@ -135,7 +137,7 @@ def parse_quarterly_metrics(html: str) -> dict[str, MetricQuarterValues]:
     if not quarters:
         raise ValueError("#quarters section is missing")
 
-    table = quarters.select_one("table")
+    table = quarters.select_one("table.data-table") or quarters.select_one("table")
     if not table:
         raise ValueError("Quarterly results table is missing")
 
@@ -149,7 +151,9 @@ def parse_quarterly_metrics(html: str) -> dict[str, MetricQuarterValues]:
         if len(cells) < 3:
             continue
 
-        label = _normalize_label(cells[0].get_text(" ", strip=True))
+        label = _normalize_label(_row_label_text(cells[0]))
+        if _skip_table_row(label):
+            continue
         metric_key = _metric_key_for_label(label)
         if not metric_key:
             continue
@@ -257,6 +261,24 @@ def _extract_headers(table) -> list[str]:
     if not header_row:
         return []
     return [cell.get_text(" ", strip=True) for cell in header_row.find_all(["th", "td"])[1:]]
+
+
+def _row_label_text(cell) -> str:
+    button = cell.select_one("button")
+    if button:
+        label_parts = []
+        for child in button.children:
+            text = getattr(child, "string", None)
+            if text:
+                label_parts.append(text)
+        label = " ".join(label_parts).strip()
+        if label:
+            return label
+    return cell.get_text(" ", strip=True)
+
+
+def _skip_table_row(label: str) -> bool:
+    return not label or label == "raw pdf"
 
 
 def _metric_key_for_label(label: str) -> str | None:

@@ -35,6 +35,12 @@ def configure_console() -> None:
             stream.reconfigure(encoding="utf-8", errors="replace")
 
 
+def configure_logging() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    logging.getLogger("azure").setLevel(logging.WARNING)
+    logging.getLogger("azure.core.pipeline.policies.http_logging_policy").setLevel(logging.WARNING)
+
+
 def load_state(path: Path = STATE_FILE) -> dict[str, dict[str, float]]:
     state_name = os.getenv("STATE_BLOB_NAME", str(path))
     data = get_storage().load_json(state_name, {})
@@ -54,6 +60,7 @@ async def run_cycle(
     direct_company: dict[str, str] | None = None,
     login_wait_seconds: int = 0,
 ) -> bool:
+    configure_console()
     companies = [direct_company] if direct_company else await scrape_latest_companies(page, login_wait_seconds)
     if company_limit is not None:
         companies = companies[:company_limit]
@@ -63,24 +70,52 @@ async def run_cycle(
 
     alerts_detected = False
     for index, company in enumerate(companies, start=1):
+        state_update_allowed = True
         try:
             if index > 1:
                 await polite_company_delay()
 
-            metrics = await scrape_company_metrics_with_retries(page, company)
             previous_state = state.get(company["id"])
-            alert_metrics = build_alert_metrics(metrics)
-            current_state = _latest_company_state_values(alert_metrics, company.get("yoy"))
+            yoy_metrics = company.get("yoy") or {}
+            alert_metrics = build_alert_metrics({})
+
+            try:
+                metrics = await scrape_company_metrics_with_retries(page, company)
+                alert_metrics = build_alert_metrics(metrics)
+            except Exception as exc:
+                if yoy_alert_needed(yoy_metrics):
+                    logging.warning(
+                        "Company detail scrape failed for %s; evaluating latest-results YOY only: %s",
+                        company.get("name", "unknown company"),
+                        exc,
+                    )
+                else:
+                    raise
+
+            current_state = _latest_company_state_values(alert_metrics, yoy_metrics)
             should_alert = company_alert_needed(alert_metrics, previous_state)
-            if not should_alert and yoy_alert_needed(company.get("yoy")):
+            yoy_candidate = yoy_alert_needed(yoy_metrics)
+            if not should_alert and yoy_candidate:
                 should_alert = _company_state_changed(current_state, previous_state)
+                if should_alert:
+                    print(f"YOY alert candidate detected for {company['name']}", flush=True)
+                else:
+                    print(f"YOY alert candidate suppressed as duplicate for {company['name']}", flush=True)
 
             if should_alert:
-                alert_message = print_combined_alert(company["name"], alert_metrics, company.get("yoy"))
-                send_telegram_alert_to_all(alert_message)
+                alert_message = print_combined_alert(company["name"], alert_metrics, yoy_metrics)
+                sent = send_telegram_alert_to_all(alert_message)
+                print(f"Telegram alert send attempted for {company['name']}: sent={sent}", flush=True)
+                state_update_allowed = sent
+                if not sent:
+                    logging.warning(
+                        "Alert detected for %s but Telegram send failed; state will not be advanced",
+                        company.get("name", "unknown company"),
+                    )
                 alerts_detected = True
 
-            state[company["id"]] = current_state
+            if current_state and state_update_allowed:
+                state[company["id"]] = current_state
         except Exception as exc:
             logging.warning("Skipping %s: %s", company.get("name", "unknown company"), exc)
 
@@ -104,7 +139,7 @@ async def monitor(
 ) -> None:
     configure_console()
     load_env_file()
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    configure_logging()
     scan_interval_seconds = _scan_interval_seconds()
     startup_message = f"Screener Bot Started - Monitoring every {scan_interval_seconds} seconds"
     print(startup_message, flush=True)
@@ -191,7 +226,11 @@ def _latest_company_state_values(alert_metrics, yoy_metrics=None) -> dict[str, f
 
 
 def _normalize_state_values(state_values: dict[str, float]) -> dict[str, float]:
-    if "pat_margin_pct" in state_values or "ebitda_margin_pct" in state_values:
+    if (
+        "pat_margin_pct" in state_values
+        or "ebitda_margin_pct" in state_values
+        or any(key.startswith("yoy_") for key in state_values)
+    ):
         return state_values
 
     sales = state_values.get("sales")
@@ -242,7 +281,7 @@ if __name__ == "__main__":
     args = parse_args()
     if args.telegram_test:
         load_env_file()
-        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+        configure_logging()
         notifier = TelegramNotifier.from_env()
         if notifier is None:
             raise SystemExit("Telegram is not configured. Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID.")
@@ -253,7 +292,7 @@ if __name__ == "__main__":
 
     if args.telegram_chat_id:
         load_env_file()
-        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+        configure_logging()
         notifier = TelegramNotifier.from_env()
         if notifier is None:
             raise SystemExit("Telegram is not configured. Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID.")

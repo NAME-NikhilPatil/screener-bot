@@ -5,6 +5,7 @@ import os
 import random
 from pathlib import Path
 from typing import Any
+from urllib import error, request
 
 from playwright.async_api import Page, async_playwright
 
@@ -79,22 +80,28 @@ async def scrape_company_metrics(page: Page, company: dict[str, str]) -> dict[st
     return parse_quarterly_metrics(html)
 
 
-async def _load_latest_results_cards(page: Page, max_scrolls: int = 12) -> None:
+async def _load_latest_results_cards(page: Page, max_scrolls: int = 30) -> None:
     previous_count = -1
+    previous_height = -1
     stable_rounds = 0
     for _ in range(max_scrolls):
         current_count = await page.locator('a[href*="/company/"]').count()
-        if current_count == previous_count:
+        current_height = await page.evaluate("document.body.scrollHeight")
+        if current_count == previous_count and current_height == previous_height:
             stable_rounds += 1
         else:
             stable_rounds = 0
             previous_count = current_count
+            previous_height = current_height
 
-        if stable_rounds >= 2:
+        if stable_rounds >= 4:
             break
 
-        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        await page.wait_for_timeout(700)
+        await page.evaluate("window.scrollBy(0, Math.max(window.innerHeight * 0.9, 800))")
+        await page.wait_for_timeout(1000)
+
+    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+    await page.wait_for_timeout(1500)
 
 
 async def scrape_company_metrics_with_retries(page: Page, company: dict[str, str], retries: int = 2) -> dict[str, Any]:
@@ -107,7 +114,35 @@ async def scrape_company_metrics_with_retries(page: Page, company: dict[str, str
             if attempt >= retries:
                 break
             await asyncio.sleep(1 + attempt)
-    raise RuntimeError(f"Failed to scrape {company['name']} after {retries + 1} attempts: {last_error}")
+
+    try:
+        return await asyncio.to_thread(_fetch_company_metrics_http, company)
+    except Exception as fallback_error:
+        raise RuntimeError(
+            f"Failed to scrape {company['name']} after {retries + 1} browser attempts "
+            f"and HTTP fallback: browser={last_error}; fallback={fallback_error}"
+        ) from fallback_error
+
+
+def _fetch_company_metrics_http(company: dict[str, str], timeout_seconds: float = 30.0) -> dict[str, Any]:
+    url = company["url"]
+    http_request = request.Request(
+        url,
+        headers={
+            "User-Agent": USER_AGENT,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        },
+        method="GET",
+    )
+    try:
+        with request.urlopen(http_request, timeout=timeout_seconds) as response:
+            html = response.read().decode("utf-8", errors="replace")
+    except error.HTTPError as exc:
+        raise RuntimeError(f"HTTP fallback returned {exc.code}") from exc
+    except error.URLError as exc:
+        raise RuntimeError(f"HTTP fallback failed: {exc.reason}") from exc
+
+    return parse_quarterly_metrics(html)
 
 
 async def polite_company_delay(min_seconds: float = 1.0, max_seconds: float = 3.0) -> None:

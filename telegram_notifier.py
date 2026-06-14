@@ -170,6 +170,7 @@ def send_telegram_alert_to_all(message: str) -> bool:
         return False
 
     recipients = get_all_telegram_recipients()
+    print(f"Telegram alert recipients found: {len(recipients)}", flush=True)
     if not recipients:
         LOGGER.warning("Telegram notification skipped because no recipients are registered")
         return False
@@ -178,6 +179,7 @@ def send_telegram_alert_to_all(message: str) -> bool:
     for chat_id in recipients:
         if _send_to_chat(bot_token, chat_id, message, _telegram_timeout_seconds()):
             sent_any = True
+    print(f"Telegram alert send result: sent_any={sent_any} recipients={len(recipients)}", flush=True)
     return sent_any
 
 
