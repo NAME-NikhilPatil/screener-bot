@@ -106,6 +106,34 @@ class ParserRegressionTests(unittest.TestCase):
 
 
 class CycleRegressionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_successful_alert_saves_state_immediately(self):
+        state: dict[str, dict[str, float]] = {}
+        saved_snapshots: list[dict[str, dict[str, float]]] = []
+
+        with (
+            patch.object(main, "scrape_company_metrics_with_retries", failing_company_detail_scrape),
+            patch.object(main, "send_telegram_alert_to_all", lambda message: True),
+            patch.object(main, "save_state", lambda saved_state: saved_snapshots.append(saved_state.copy())),
+        ):
+            alerts_detected = await main.run_cycle(None, 1, state, direct_company=sjs_company())
+
+        self.assertTrue(alerts_detected)
+        self.assertGreaterEqual(len(saved_snapshots), 2)
+        self.assertIn("SJS", saved_snapshots[0])
+        self.assertEqual(saved_snapshots[0]["SJS"]["yoy_sales_current"], 260.0)
+
+    def test_blob_state_refresh_merges_latest_state_before_company_check(self):
+        state: dict[str, dict[str, float]] = {"LOCAL": {"sales": 1.0}}
+
+        with (
+            patch.dict("os.environ", {"STATE_BACKEND": "blob"}, clear=True),
+            patch.object(main, "load_state", return_value={"ASIANPAINT": {"sales": 100.0}}),
+        ):
+            main._refresh_shared_state(state)
+
+        self.assertEqual(state["LOCAL"]["sales"], 1.0)
+        self.assertEqual(state["ASIANPAINT"]["sales"], 100.0)
+
     async def test_yoy_alert_sends_even_when_company_detail_scrape_fails(self):
         state: dict[str, dict[str, float]] = {}
         sent_messages: list[str] = []

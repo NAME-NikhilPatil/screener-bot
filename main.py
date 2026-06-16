@@ -75,6 +75,7 @@ async def run_cycle(
             if index > 1:
                 await polite_company_delay()
 
+            _refresh_shared_state(state)
             previous_state = state.get(company["id"])
             yoy_metrics = company.get("yoy") or {}
             alert_metrics = build_alert_metrics({})
@@ -116,6 +117,8 @@ async def run_cycle(
 
             if current_state and state_update_allowed:
                 state[company["id"]] = current_state
+                save_state(state)
+                print(f"State saved for {company['name']}", flush=True)
         except Exception as exc:
             logging.warning("Skipping %s: %s", company.get("name", "unknown company"), exc)
 
@@ -199,6 +202,15 @@ def _scan_interval_seconds() -> int:
     except ValueError:
         return DEFAULT_SCAN_INTERVAL_SECONDS
     return max(1, value)
+
+
+def _refresh_shared_state(state: dict[str, dict[str, float]]) -> None:
+    if os.getenv("STATE_BACKEND", "").strip().lower() != "blob":
+        return
+
+    latest_state = load_state()
+    if latest_state:
+        state.update(latest_state)
 
 
 def _company_state_changed(current_state_values: dict[str, float], state_values: dict[str, float] | None = None) -> bool:
